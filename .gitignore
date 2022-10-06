@@ -1,5 +1,7 @@
 *.suo
 *.user
-Capture/obj
-TestScreenshot/obj
+.vs
+packages/
+Capture/obj/
+HRSS/obj/
 bin

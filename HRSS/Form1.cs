@@ -1,279 +1,269 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.ComponentModel;
-using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
-using System.Text;
+using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Diagnostics;
-using System.Threading;
-using EasyHook;
-using System.Runtime.Remoting.Channels.Ipc;
-using System.Runtime.Remoting;
-using System.Runtime.InteropServices;
-using System.IO;
-using Capture.Interface;
-using Capture.Hook;
+using AutoUpdaterDotNET;
 using Capture;
+using Capture.Hook;
+using Capture.Interface;
+using ImageFormat = System.Drawing.Imaging.ImageFormat;
 
 namespace HRSS
 {
-    public partial class Form1 : Form
-    {
-        public Form1()
-        {
-            InitializeComponent();
-        }
+	public partial class Form1 : Form
+	{
+		private const int SwpNopos = 0x0002;
+		private const int SwpNozorder = 0x0004;
+		private const int SwpShowwindow = 0x0040;
+		private const int SwpNosendchanging = 0x0400;
+		private const int ScreenShotTimeoutSeconds = 15;
+		private readonly string _desktopPath;
+		private CaptureProcess _captureProcess;
+		private bool _capturing;
+		private IntPtr _hwnd;
+		private NativeMethods.WindowShowStyle _style;
 
-        private void Form1_Load(object sender, EventArgs e)
-        {
-        }
+		private int _w0, _h0;
 
-        private void btnInject_Click(object sender, EventArgs e)
-        {
-            if (_captureProcess == null)
-            {
-                btnInject.Enabled = false;
+		public Form1()
+		{
+			InitializeComponent();
+			FormClosing += Form_FormClosing;
+			_w0 = _h0 = 0;
+			_hwnd = IntPtr.Zero;
+			_desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+		}
 
-                if (cbAutoGAC.Checked)
-                {
-                    // NOTE: On some 64-bit setups this doesn't work so well.
-                    //       Sometimes if using a 32-bit target, it will not find the GAC assembly
-                    //       without a machine restart, so requires manual insertion into the GAC
-                    // Alternatively if the required assemblies are in the target applications
-                    // search path they will load correctly.
+		private void Form1_Load(object sender, EventArgs e)
+		{
+			AutoUpdater.Start("http://www.imvu-e.com/products/hrss/release.xml");
+		}
 
-                    // Must be running as Administrator to allow dynamic registration in GAC
-                    Config.Register("Capture",
-                        "Capture.dll");
-                }
-                
-                AttachProcess();
-            }
-            else
-            {
-                HookManager.RemoveHookedProcess(_captureProcess.Process.Id);
-                _captureProcess.CaptureInterface.Disconnect();
-                _captureProcess = null;
-            }
+		private void Form_FormClosing(object sender, FormClosingEventArgs e)
+		{
+			Detach();
+		}
 
-            if (_captureProcess != null)
-            {
-                btnInject.Text = "Detach";
-                btnInject.Enabled = true;
-            }
-            else
-            {
-                btnInject.Text = "Inject";
-                btnInject.Enabled = true;
-            }
-        }
+		private void AttachProcess()
+		{
+			var process = Process.GetProcessesByName("IMVUClient").First();
 
-        int processId = 0;
-        Process _process;
-        CaptureProcess _captureProcess;
-        private void AttachProcess()
-        {
-            string exeName = Path.GetFileNameWithoutExtension(textBox1.Text);
-            
-            Process[] processes = Process.GetProcessesByName(exeName);
-            foreach (Process process in processes)
-            {
-                // Simply attach to the first one found.
+			if (process.MainWindowHandle == IntPtr.Zero)
+				Debug.Print("process doesn't have a mainwindowhandle yet");
 
-                // If the process doesn't have a mainwindowhandle yet, skip it (we need to be able to get the hwnd to set foreground etc)
-                if (process.MainWindowHandle == IntPtr.Zero)
-                {
-                    continue;
-                }
+			if (HookManager.IsHooked(process.Id))
+				Debug.Print($"process id {process.Id} is already hooked");
 
-                // Skip if the process is already hooked (and we want to hook multiple applications)
-                if (HookManager.IsHooked(process.Id))
-                {
-                    continue;
-                }
+			var config = new CaptureConfig
+			{
+				Direct3DVersion = Direct3DVersion.AutoDetect
+			};
 
-                Direct3DVersion direct3DVersion = Direct3DVersion.Direct3D10;
+			var captureInterface = new CaptureInterface();
+			captureInterface.RemoteMessage += CaptureInterface_RemoteMessage;
+			_captureProcess = new CaptureProcess(process, config, captureInterface);
+		}
 
-                if (rbDirect3D11.Checked)
-                {
-                    direct3DVersion = Direct3DVersion.Direct3D11;
-                }
-                else if (rbDirect3D10_1.Checked)
-                {
-                    direct3DVersion = Direct3DVersion.Direct3D10_1;
-                }
-                else if (rbDirect3D10.Checked)
-                {
-                    direct3DVersion = Direct3DVersion.Direct3D10;
-                }
-                else if (rbDirect3D9.Checked)
-                {
-                    direct3DVersion = Direct3DVersion.Direct3D9;
-                }
-                else if (rbAutodetect.Checked)
-                {
-                    direct3DVersion = Direct3DVersion.AutoDetect;
-                }
+		/// <summary>
+		///     Display messages from the target process
+		/// </summary>
+		/// <param name="event"></param>
+		private static void CaptureInterface_RemoteMessage(MessageReceivedEventArgs @event)
+		{
+			Debug.Print($"{@event.MessageType} : {@event.Message}");
+		}
 
-                CaptureConfig cc = new CaptureConfig()
-                {
-                    Direct3DVersion = direct3DVersion,
-                    ShowOverlay = cbDrawOverlay.Checked
-                };
+		/// <summary>
+		///     Create the screen shot request
+		/// </summary>
+		private void CreateScreenshotRequest()
+		{
+			_captureProcess.BringProcessWindowToFront();
+			var rect = new Rectangle(0, 0, 0, 0); // All zerso mean full screen
+			_captureProcess.CaptureInterface.BeginGetScreenshot(rect, TimeSpan.FromSeconds(ScreenShotTimeoutSeconds),
+				Callback);
+		}
 
-                processId = process.Id;
-                _process = process;
+		/// <summary>
+		///     The callback for when the screenshot has been taken
+		/// </summary>
+		/// <param name="result"></param>
+		private void Callback(IAsyncResult result)
+		{
+			NativeMethods.ShowWindow(_hwnd, _style);
+			NativeMethods.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, _w0, _h0,
+				SwpNozorder | SwpShowwindow | SwpNosendchanging | SwpNopos);
 
-                var captureInterface = new CaptureInterface();
-                captureInterface.RemoteMessage += new MessageReceivedEvent(CaptureInterface_RemoteMessage);
-                _captureProcess = new CaptureProcess(process, cc, captureInterface);
-                
-                break;
-            }
-            Thread.Sleep(10);
+			using (var screenshot = _captureProcess.CaptureInterface.EndGetScreenshot(result))
+			{
+				Bitmap bitmap = null;
+				_captureProcess.CaptureInterface.DisplayInGameText("Screenshot captured...");
+				if (screenshot?.Data == null)
+				{
+					TopMostMessageBox.Show(
+						$"Unable to get screenshot in {ScreenShotTimeoutSeconds} seconds. " + Environment.NewLine + " Try a smaller resolution, or ensure IMVU's 3D renderer is set to Direct3D",
+						"Failure to screenshot", MessageBoxButtons.OK);
+				}
+				else
+				{
+					bitmap = screenshot.ToBitmap();
+					if (checkBox1.Checked) bitmap.MakeTransparent(bitmap.GetPixel(1, 1));
+					bitmap.Save(_desktopPath + "\\" + GetTimeDate() + ".png", ImageFormat.Png);
+				}
 
-            if (_captureProcess == null)
-            {
-                MessageBox.Show("No executable found matching: '" + exeName + "'");
-            }
-            else
-            {
-                btnLoadTest.Enabled = true;
-                btnCapture.Enabled = true;
-            }
-        }
+				_capturing = false;
 
-        /// <summary>
-        /// Display messages from the target process
-        /// </summary>
-        /// <param name="message"></param>
-        void CaptureInterface_RemoteMessage(MessageReceivedEventArgs message)
-        {
-            txtDebugLog.Invoke(new MethodInvoker(delegate()
-                {
-                    txtDebugLog.Text = String.Format("{0}\r\n{1}", message, txtDebugLog.Text);
-                })
-            );
-        }
+				Invoke(new MethodInvoker(() =>
+				{
+					groupCapture.Enabled = false;
+					pictureBox1.Image?.Dispose();
+					pictureBox1.Image = bitmap;
+					pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
+					progressBar1.Value = bitmap == null ? 0 : progressBar1.Maximum;
+				}));
+			}
+		}
 
-        /// <summary>
-        /// Display debug messages from the target process
-        /// </summary>
-        /// <param name="clientPID"></param>
-        /// <param name="message"></param>
-        void ScreenshotManager_OnScreenshotDebugMessage(int clientPID, string message)
-        {
-            txtDebugLog.Invoke(new MethodInvoker(delegate()
-                {
-                    txtDebugLog.Text = String.Format("{0}:{1}\r\n{2}", clientPID, message, txtDebugLog.Text);
-                })
-            );
-        }
+		public static string GetTimeDate()
+		{
+			return DateTime.Now.ToString("yyyyMMdd-HHmmss");
+		}
 
-        DateTime start;
-        DateTime end;
+		private void Inject()
+		{
+			if (_captureProcess != null)
+				throw new Exception("Capture process already injected");
 
-        private void btnCapture_Click(object sender, EventArgs e)
-        {
-            start = DateTime.Now;
-            progressBar1.Maximum = 1;
-            progressBar1.Step = 1;
-            progressBar1.Value = 0;
+			AttachProcess();
+		}
 
-            DoRequest();
-        }
+		private void Detach()
+		{
+			if (_captureProcess == null) return;
 
-        private void btnLoadTest_Click(object sender, EventArgs e)
-        {
-            // Note: we bring the target application into the foreground because
-            //       windowed Direct3D applications have a lower framerate 
-            //       if not the currently focused window
-            _captureProcess.BringProcessWindowToFront();
-            start = DateTime.Now;
-            progressBar1.Maximum = Convert.ToInt32(txtNumber.Text);
-            progressBar1.Minimum = 0;
-            progressBar1.Step = 1;
-            progressBar1.Value = 0;
-            DoRequest();
-        }
+			HookManager.RemoveHookedProcess(_captureProcess.Process.Id);
+			_captureProcess.Dispose();
+			_captureProcess = null;
+		}
 
-        /// <summary>
-        /// Create the screen shot request
-        /// </summary>
-        void DoRequest()
-        {
-            progressBar1.Invoke(new MethodInvoker(delegate()
-                {
-                    if (progressBar1.Value < progressBar1.Maximum)
-                    {
-                        progressBar1.PerformStep();
+		private void buttonCapture_Click(object sender, EventArgs e)
+		{
+			groupCapture.Enabled = false;
+			pictureBox1.Image = null;
+			timer1.Start();
+			progressBar1.Maximum = 10 * ScreenShotTimeoutSeconds;
+			progressBar1.Value = 1;
+			progressBar1.Update();
+			pictureBox1.Update();
 
-                        _captureProcess.BringProcessWindowToFront();
-                        // Initiate the screenshot of the CaptureInterface, the appropriate event handler within the target process will take care of the rest
-                        Size? resize = null;
-                        if (!String.IsNullOrEmpty(txtResizeHeight.Text) && !String.IsNullOrEmpty(txtResizeWidth.Text))
-                            resize = new System.Drawing.Size(int.Parse(txtResizeWidth.Text), int.Parse(txtResizeHeight.Text));
-                        _captureProcess.CaptureInterface.BeginGetScreenshot(new Rectangle(int.Parse(txtCaptureX.Text), int.Parse(txtCaptureY.Text), int.Parse(txtCaptureWidth.Text), int.Parse(txtCaptureHeight.Text)), new TimeSpan(0, 0, 2), Callback, resize, (ImageFormat)Enum.Parse(typeof(ImageFormat), cmbFormat.Text));
-                    }
-                    else
-                    {
-                        end = DateTime.Now;
-                        txtDebugLog.Text = String.Format("Debug: {0}\r\n{1}", "Total Time: " + (end-start).ToString(), txtDebugLog.Text);
-                    }
-                })
-            );
-        }
+			int w, h;
+			w = h = 0;
+			if (radio1x.Checked)
+			{
+				w = _w0;
+				h = _h0;
+			}
 
-        /// <summary>
-        /// The callback for when the screenshot has been taken
-        /// </summary>
-        /// <param name="clientPID"></param>
-        /// <param name="status"></param>
-        /// <param name="screenshotResponse"></param>
-        void Callback(IAsyncResult result)
-        {
-            using (Screenshot screenshot = _captureProcess.CaptureInterface.EndGetScreenshot(result))
-            try
-            {
-                _captureProcess.CaptureInterface.DisplayInGameText("Screenshot captured...");
-                if (screenshot != null && screenshot.Data != null)
-                {
-                    pictureBox1.Invoke(new MethodInvoker(delegate()
-                    {
-                        if (pictureBox1.Image != null)
-                        {
-                            pictureBox1.Image.Dispose();
-                        }
-                        pictureBox1.Image = screenshot.ToBitmap();
-                    })
-                    );
-                }
+			if (radio2x.Checked)
+			{
+				w = _w0 * 2;
+				h = _h0 * 2;
+			}
 
-                Thread t = new Thread(new ThreadStart(DoRequest));
-                t.Start();
-            }
-            catch
-            {
-            }
-        }
+			if (radio4x.Checked)
+			{
+				w = _w0 * 4;
+				h = _h0 * 4;
+			}
 
-        private void btnDisplayOverlay_Click(object sender, EventArgs e)
-        {
-            _captureProcess.CaptureInterface.DrawOverlayInGame(new Capture.Hook.Common.Overlay
-            {
-                Elements = new List<Capture.Hook.Common.IOverlayElement>
-                {
-                    new Capture.Hook.Common.FramesPerSecond(new System.Drawing.Font("Arial", 16, FontStyle.Bold)) {
-                            Location = new Point(25, 25),
-                            Color = Color.Red,
-                            AntiAliased = true,
-                            Text = "{0:N0} fps"
-                        },
-                },
-                Hidden = !cbDrawOverlay.Checked
-            });
-        }
-    }
+			if (radio8x.Checked)
+			{
+				w = _w0 * 8;
+				h = _h0 * 8;
+			}
+
+			if (radioCustom.Checked)
+			{
+				w = _w0;
+				h = _h0;
+				var s = textCustom.Text.Split('x');
+				if (s.Length >= 1) w = int.Parse(s[0]);
+				if (s.Length >= 2) h = int.Parse(s[1]);
+			}
+
+			_style = NativeMethods.GetPlacement(_hwnd).showCmd;
+			NativeMethods.ShowWindow(_hwnd, NativeMethods.WindowShowStyle.ShowNormal);
+
+			NativeMethods.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, w, h,
+				SwpNozorder | SwpShowwindow | SwpNosendchanging | SwpNopos);
+			_capturing = true;
+
+			Task.Factory.StartNew(CreateScreenshotRequest);
+		}
+
+
+		private void Timer1_Tick(object sender, EventArgs e)
+		{
+			if (progressBar1.Value != progressBar1.Maximum)
+				progressBar1.Value++;
+			else
+				timer1.Stop();
+		}
+
+		private void TextCustom_TextChanged(object sender, EventArgs e)
+		{
+			radioCustom.Checked = true;
+		}
+
+		private void timerMonitor_Tick(object sender, EventArgs e)
+		{
+			if (_capturing) return;
+
+			var processes = Process.GetProcessesByName("IMVUClient");
+			if (processes.Length == 0)
+			{
+				labelStatus.Text = @"IMVU not running.";
+				labelStatus.ForeColor = Color.Red;
+				labelStatus.Update();
+				groupCapture.Enabled = false;
+				return;
+			}
+
+			if (processes[0].MainWindowHandle == IntPtr.Zero)
+			{
+				labelStatus.Text = @"IMVU in background.";
+				labelStatus.ForeColor = Color.Red;
+				labelStatus.Update();
+				groupCapture.Enabled = false;
+				return;
+			}
+
+			NativeMethods.GetWindowRect(processes[0].MainWindowHandle, out var rect);
+
+			_w0 = rect.Width - rect.X;
+			_h0 = rect.Height - rect.Y;
+			if (_w0 < 200 || _h0 < 200)
+			{
+				labelStatus.Text = @"IMVU is minimized.";
+				labelStatus.ForeColor = Color.Red;
+				labelStatus.Update();
+				groupCapture.Enabled = false;
+				_w0 = _h0 = 0;
+			}
+			else
+			{
+				labelStatus.Text = _w0 + @"x" + _h0;
+				labelStatus.ForeColor = Color.Black;
+				labelStatus.Update();
+				groupCapture.Enabled = true;
+				if (_hwnd == processes[0].MainWindowHandle)
+					return;
+
+				Inject();
+				_hwnd = processes[0].MainWindowHandle;
+			}
+		}
+	}
 }

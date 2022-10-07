@@ -1,4 +1,4 @@
-﻿namespace TestScreenshot
+﻿namespace HRSS
 {
     partial class Form1
     {

@@ -17,7 +17,7 @@ using Capture.Interface;
 using Capture.Hook;
 using Capture;
 
-namespace TestScreenshot
+namespace HRSS
 {
     public partial class Form1 : Form
     {
